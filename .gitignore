@@ -19,6 +19,9 @@ ENV/
 # macOS
 .DS_Store
 
+# Debugger state captured from the game (Main.py 'C' key)
+debug_state.json
+
 # Pytest cache
 .pytest_cache/
 
