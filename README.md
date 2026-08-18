@@ -14,6 +14,23 @@ This project implements a bread-first search (BFS) algorithm applied to the clas
 - Real-time visualization of algorithm
 - Cohesive and functional coding design
 
+## Demo
+
+
+
+https://github.com/user-attachments/assets/edf4525d-db11-489b-9ed1-2ee1c6205e25
+
+
+
+## Demo (max speed)
+
+
+
+https://github.com/user-attachments/assets/c6cea66f-c53a-4a2c-9eaa-bcebd7b1eb18
+
+
+
+
 ## Project Structure
 
 - `Main.py`: Runs Pygame framework and implements algorithms
