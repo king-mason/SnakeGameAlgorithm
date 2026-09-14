@@ -1,8 +1,7 @@
 import pygame
 from collections import deque
 import random
-from Algorithm import create_adjacent_grid, A_star_path, A_star_path_complete, \
-    follow_tail, A_star_path_tail, can_reach_tail, snake_after_eating, DFS_long_path, BFS_path, BFS_path_complete
+from Algorithm import create_adjacent_grid, SearchContext
 import sys
 import json
 
@@ -16,7 +15,26 @@ BLUE = "blue"
 
 class SnakeGame:
     def __init__(self, x, y, block_size, border_size=None, delay=5,
-                 head_color=(60, 120, 230), tail_color=(46, 160, 66)):
+                 head_color=(60, 120, 230), tail_color=(46, 160, 66),
+                 headless=False, verbose=None, program_seed=None,
+                 first_game_seed=None):
+        # headless: skip pygame entirely (no window, no drawing, no frame delay) --
+        # used by the benchmarker to run games at full speed. verbose: print the
+        # decide_path debug lines; defaults to True for normal play, False when
+        # headless (a benchmark run would otherwise flood stdout).
+        self.headless = headless
+        self.verbose = verbose if verbose is not None else not headless
+
+        if program_seed:
+            self.program_seed = random.Random(program_seed)
+        else: 
+            self.program_seed = random.Random(random.random())
+        if first_game_seed:
+            self.game_seed = first_game_seed
+        else:
+            self.game_seed = self.program_seed.randrange(2**32)
+        self.game_random = random.Random(self.game_seed)
+
         self.x = x
         self.y = y
         self.block_size = block_size
@@ -31,39 +49,33 @@ class SnakeGame:
 
         self.snake = deque([(2, 1), (1, 1)])
         self.start_len = len(self.snake)   # for the score (apples eaten)
+        self.ticks = 0                     # moves taken this game (benchmark timing)
+        self.avg_point_ticks = 0            # average moves per point (benchmark timing)
+        self.point_tick_history = []       # moves taken to reach each successive point (benchmark timing)
         self.grid = create_adjacent_grid(self.x, self.y)
         self.all_points = list(self.grid.keys())
         self.apple = self.choose_apple(self.all_points, self.snake)
         self.original_delay = delay
         self.delay = delay
         self.paused = False
+        self.game_over = False
 
-        # Survival-mode state (see decide_path): a committed path we follow rather
-        # than recomputing the expensive tail/DFS search every tick, plus stall
-        # detection so a tail-chasing cycle is broken by a space-filling reorg.
-        self.survival_path = []          # committed survival steps (Main pops from it)
-        self.survival_ticks = 0          # ticks in the current survival stint
-        self.survival_seen = set()       # snake configs seen this stint (cycle detection)
-        self.survival_stalled = False
-        self.stall_limit = len(self.grid)  # safety-net cap; tunable
-        # Only run the expensive full-body completeness search once free space is
-        # this small (its cost explodes with free-cell count). Tunable.
-        self.complete_max_free = 25
+        self.search = SearchContext(self.apple, self.grid, verbose=self.verbose)
 
-        pygame.init()
-        self.screen = pygame.display.set_mode((self.window_width, self.window_height))
-        self.clock = pygame.time.Clock()
-        self.screen.fill(BLACK)
-        self.font = pygame.font.Font(None, self.window_width // 4)
-        self.small_font = pygame.font.Font(None, max(20, self.block_size))
+        if not self.headless:
+            pygame.init()
+            self.screen = pygame.display.set_mode((self.window_width, self.window_height))
+            self.clock = pygame.time.Clock()
+            self.screen.fill(BLACK)
+            self.font = pygame.font.Font(None, self.window_width // 4)
+            self.small_font = pygame.font.Font(None, max(20, self.block_size))
         
-    @staticmethod
-    def choose_apple(all_points, snake_deque):
+    def choose_apple(self, all_points, snake_deque):
         """Return a random free point or None if no free cells remain."""
         free = list(set(all_points) - set(snake_deque))
         if not free:
             return None
-        return random.choice(free)
+        return self.game_random.choice(free)
 
     def dump_state(self):
         """Save the current board state to STATE_FILE (and clipboard, if possible)
@@ -91,95 +103,35 @@ class SnakeGame:
             if event.type == pygame.QUIT:
                 pygame.quit()
                 sys.exit()
-            elif event.type == pygame.KEYDOWN:
+            if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_SPACE:
                     self.paused = not self.paused
                     print("[game] paused" if self.paused else "[game] resumed")
                 elif event.key == pygame.K_c:
+                    print("game state saved")
                     self.dump_state()
-                if event.key == pygame.K_TAB and self.original_delay > 5:
+                elif event.key == pygame.K_s:
+                    print("game seed:", self.game_seed)
+                elif event.key == pygame.K_r and self.game_over:
+                    self.game_over = False
+                elif event.key == pygame.K_TAB and self.original_delay > 5:
                     self.delay = 5
             if event.type == pygame.KEYUP:
                 if event.key == pygame.K_TAB:
                     self.delay = self.original_delay
 
-    def decide_path(self):
-        """Next path to follow.
-
-        Every tick we cheaply re-check for a safe path to the apple. When there
-        isn't one we go into survival mode, but instead of recomputing the
-        expensive tail/DFS search every tick we COMMIT to a survival path and just
-        follow it, only recomputing when it runs out. If survival keeps cycling
-        without opening an apple route (a repeated configuration, or too many
-        ticks), we switch to a space-filling DFS reorganization to break the
-        stall. Every path returned is collision-free, so the snake never dies by
-        choice.
-        """
-        if self.apple is None:
-            return []
-
-        # (1) Cheap recheck: has a safe path to the apple opened up?
-        path = A_star_path(self.grid, self.snake, self.apple)
-        if not path:
-            # The fast (cell,time) search can prune a body-config that still
-            # reaches a safe apple (e.g. a tail-chase detour). Retry with the
-            # complete full-body search -- but ONLY once free space is small
-            # (self.complete_max_free). Its cost stays cheap there because the
-            # search runs out of room and terminates fast; above ~30 free cells
-            # it explodes (a state cap does NOT bound it -- each state is O(len)).
-            # When lots of cells are open we skip it and tail-follow instead; a
-            # safe path in open space, if one exists, is found by the fast search.
-            free_cells = len(self.grid) - len(self.snake)
-            if free_cells <= self.complete_max_free:
-                print("running BFS complete")
-                path = BFS_path_complete(self.grid, self.snake, self.apple)
-            else:
-                print("running BFS")
-                path = BFS_path(self.grid, self.snake, self.apple)
-        if path:
-            print("path found")
-            self._reset_survival()
-            return path
-
-        # (2) Survival — no safe apple path.
-        self.survival_ticks += 1
-        config = tuple(self.snake)
-        if config in self.survival_seen or self.survival_ticks > self.stall_limit:
-            self.survival_stalled = True     # cycling / stuck: reorganize next recompute
-        self.survival_seen.add(config)
-
-        # Follow the committed survival path if it still has steps.
-        if self.survival_path:
-            return self.survival_path
-
-        # Committed path exhausted: recompute survival navigation.
-        if self.survival_stalled:
-            print("stalled, running DFS longest path")
-            self.survival_path = DFS_long_path(self.grid, self.snake, self.apple)
-            self.survival_stalled = False    # re-arm; the reorg gets a chance to open a route
-        else:
-            print("finding survival path, running A star path to tail")
-            self.survival_path = A_star_path_tail(self.grid, self.snake)
-        # Last resort: no full survival path, but if ANY legal move exists, take a
-        # single safe step rather than giving up. Only [] when truly boxed in.
-        if not self.survival_path:
-            print("Last resort...")
-            self.survival_path = follow_tail(self.grid, self.snake, self.apple)
-        return self.survival_path            # [] only when no legal move remains
-
-    def _reset_survival(self):
-        self.survival_path = []
-        self.survival_ticks = 0
-        self.survival_seen.clear()
-        self.survival_stalled = False
-
     def reset_game(self):
         """Reset to a fresh game (used by 'play again')."""
         self.snake = deque([(2, 1), (1, 1)])
         self.start_len = len(self.snake)
+        self.ticks = 0
+        self.avg_point_ticks = 0
+        self.point_tick_history = []
+        self.game_seed = self.program_seed.randrange(2**32)
+        self.game_random = random.Random(self.game_seed)
         self.apple = self.choose_apple(self.all_points, self.snake)
         self.paused = False
-        self._reset_survival()
+        self.search.new_apple(self.apple)
 
     def score(self):
         return len(self.snake) - self.start_len
@@ -202,32 +154,38 @@ class SnakeGame:
     def main(self):
         while True:
             won = self.play_one_game()
-            if not self.wait_for_restart(won):   # blocks until R (restart) or quit
-                break
+            self.wait_for_restart(won)   # blocks until R (restart) or quit
+            print("Playing new game")
             self.reset_game()
 
     def play_one_game(self):
         """Run one game to completion. Returns True if the board was filled (win)."""
-        current_path = self.decide_path()
+        current_path = self.search.decide_path(self.snake)
+        last_point_ticks = 0
 
         while True:
-            self.drawGrid()
-            self.drawSnake(self.snake)
-            self.draw_score()
+            if not self.headless:
+                self.drawGrid()
+                self.drawSnake(self.snake)
+                self.draw_score()
             if not current_path:
                 return len(self.snake) == len(self.grid)
-            self.handle_events()
+            if not self.headless:
+                self.handle_events()
 
             if not self.paused:
+                self.ticks += 1
                 next_space = current_path.pop()
 
                 if next_space == self.apple:
                     self.snake.appendleft(self.apple) # type: ignore
+                    interval = self.ticks - last_point_ticks
+                    self.point_tick_history.append(interval)
+                    self.avg_point_ticks += (interval - self.avg_point_ticks) / self.score()
+                    last_point_ticks = self.ticks
                     self.apple = self.choose_apple(self.all_points, self.snake)
-                    # Eating grows the snake, so any committed survival path is now
-                    # stale — start the next decision fresh.
-                    self._reset_survival()
-                    current_path = self.decide_path()
+                    self.search.new_apple(self.apple)
+                    current_path = self.search.decide_path(self.snake)
                 else:
                     self.snake.appendleft(next_space)
                     self.snake.pop()
@@ -235,17 +193,19 @@ class SnakeGame:
                     # re-decide each tick: cheaply recheck for a safe apple path and
                     # follow the committed survival path.
                     if not current_path or current_path[0] != self.apple:
-                        current_path = self.decide_path()
-            else:
+                        current_path = self.search.decide_path(self.snake)
+            elif not self.headless:
                 self.draw_pause_symbol()
 
-            pygame.display.update()
-            pygame.time.wait(self.delay)
+            if not self.headless:
+                pygame.display.update()
+                pygame.time.wait(self.delay)
 
     def wait_for_restart(self, won):
         """Show the game-over screen; return True to play again, False to quit."""
         self.drawGrid()
         self.drawSnake(self.snake)
+        self.game_over = True
         if won:
             win_text = self.font.render("Game Won!", True, "gold")
             rect = win_text.get_rect(center=(self.window_width // 2, self.window_height // 4))
@@ -257,15 +217,9 @@ class SnakeGame:
         rect = again.get_rect(center=(self.window_width // 2, self.window_height * 3 // 4))
         self.screen.blit(again, rect)
         pygame.display.update()
-
-        while True:
-            for event in pygame.event.get():
-                if event.type == pygame.QUIT:
-                    pygame.quit()
-                    sys.exit()
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_r:
-                    return True
-            pygame.time.wait(20)
+        while self.game_over:
+            self.handle_events()
+        return True
 
     def drawGrid(self):
 
@@ -344,8 +298,8 @@ class SnakeGame:
 
 
 if __name__ == "__main__":
-    random.seed(42)
-    game = SnakeGame(10, 10, block_size=30, border_size=3, delay=5,
-                     head_color=(90, 180, 255), tail_color=(240, 90, 255))
+    game = SnakeGame(20, 15, block_size=30, border_size=3, delay=10,
+                     head_color=(90, 180, 255), tail_color=(60, 255, 100),
+                     program_seed=64, first_game_seed=2045084184)
                     #  head_color=(60, 120, 230), tail_color=(46, 160, 66))
     game.main()

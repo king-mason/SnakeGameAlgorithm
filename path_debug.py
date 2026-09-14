@@ -36,14 +36,10 @@ COMPLETE_MAX_FREE = 25              # matches Main.complete_max_free (gate for t
 
 from Algorithm import (
     create_adjacent_grid,
-    A_star_path,
-    A_star_path_complete,
-    A_star_path_tail,
-    can_reach_tail,
-    snake_after_eating,
     get_new_snake,
     manhattan_distance,
-    BFS_path,
+    snake_after_eating,
+    SearchContext
 )
 
 # -----------------------------------------------------------------------------
@@ -80,7 +76,7 @@ def astar_steps(G, snake, apple):
                "frontier": {p[-1] for (_f, _o, _c, p) in open_heap}}
 
         if v == apple:
-            if can_reach_tail(G, snake_after_eating(snake, path)):
+            if SearchContext(apple, G).can_reach_tail(snake_after_eating(snake, path)):
                 yield {"phase": "done", "result": path[:0:-1], "safe": True,
                        "path": list(path), "visited": {c for (c, _t) in visited},
                        "frontier": {p[-1] for (_f, _o, _c, p) in open_heap}}
@@ -141,7 +137,7 @@ def astar_complete_steps(G, snake, apple, max_states=3000):
                "frontier": {p[-1] for (_f, _o, _c, p) in open_heap}}
 
         if v == apple:
-            if can_reach_tail(G, snake_after_eating(snake, path)):
+            if SearchContext(apple, G).can_reach_tail(snake_after_eating(snake, path)):
                 yield {"phase": "done", "result": path[:0:-1], "safe": True, "path": list(path),
                        "visited": set(visited_cells), "frontier": set(), "states": states, "capped": False}
                 return
@@ -260,6 +256,57 @@ def astar_tail_steps(G, snake):
            "visited": {c for (c, _t) in visited}, "frontier": set()}
 
 
+def bfs_steps(G, snake, apple):
+    """Mirror of A_star_path (fast (cell,time) search), yielding state per pop."""
+    snake_head = snake[0]
+    if snake_head == apple or apple is None:
+        yield {"phase": "done", "result": [], "safe": False,
+               "path": [], "visited": set(), "frontier": set()}
+        return
+
+    max_time = len(G)
+    tie = count()
+    Q = deque([[snake_head]])
+    visited = {(snake_head, 0)}
+
+    while Q:
+        path = Q.popleft()
+        v = path[-1]  # (row, col)
+        t = len(path) - 1                  # moves made so far.
+
+        if t >= max_time:
+            continue
+
+        for node in G[v]:
+            new_path = path + [node]
+            new_snake = get_new_snake(snake, new_path)
+            # The new head must not overlap the rest of its own body at that
+            # moment. get_new_snake already drops the vacated tail cell.
+            if node in set(new_snake[1:]):
+                continue
+
+            yield {"phase": "pop", "path": list(path),
+                    "visited": {c for (c, _t) in visited},
+                    "frontier": {p[-1] for p in Q}}
+
+            if node == apple:
+                if SearchContext(apple, G).can_reach_tail(snake_after_eating(snake, new_path)):
+                    yield {"phase": "done", "result": path[:0:-1], "safe": True,
+                                           "path": list(path), "visited": {c for (c, _t) in visited},
+                                           "frontier": {p[-1] for p in Q}}
+                    return
+                continue
+
+            state = (node, len(new_path) - 1)
+            if state in visited:
+                continue
+            visited.add(state)
+            Q.append(new_path)
+
+    yield {"phase": "done", "result": [], "safe": False,
+           "path": [], "visited": {c for (c, _t) in visited}, "frontier": set()}
+
+
 def reach_tail_cell(G, snake):
     """Bool version of the accurate tail-reachability check (final result only)."""
     last = None
@@ -274,12 +321,13 @@ def compute_decision(G, snake, apple):
     else survival. Returns (mode, head_first_path)."""
     if apple is None:
         return "no apple", []
-    path = A_star_path(G, snake, apple)                 # apple-first, head-excluded
+    search = SearchContext(apple, G)
+    path = search.A_star_path(snake)                 # apple-first, head-excluded
     if not path and (len(G) - len(snake)) <= COMPLETE_MAX_FREE:
-        path = A_star_path_complete(G, snake, apple)    # completeness fallback
+        path = search.BFS_path_complete(snake)    # completeness fallback
     if path:
         return "SAFE apple path", [snake[0]] + path[::-1]
-    if A_star_path_tail(G, snake):                      # can we still reach our tail?
+    if search.A_star_path_tail(snake):                      # can we still reach our tail?
         return "TAIL survival (reachable)", []
     return "STUCK - no safe path", []
 
@@ -391,8 +439,12 @@ class Debugger:
             self.gen = astar_complete_steps(self.grid, list(self.snake), self.apple)
             self.flood_label = ""
             self.flood_snake = None
+        elif self.view == "bfs":
+            self.gen = bfs_steps(self.grid, list(self.snake), self.apple)
+            self.flood_label = ""
+            self.flood_snake = None
         else:  # accurate A* search to the tail (on the post-eat snake)
-            raw = BFS_path(self.grid, list(self.snake), self.apple) if self.apple else []
+            raw = SearchContext(self.apple, self.grid).BFS_path(list(self.snake)) if self.apple else []
             if raw:
                 head_first = [self.snake[0]] + raw[::-1]
                 self.flood_snake = snake_after_eating(list(self.snake), head_first)
@@ -599,6 +651,15 @@ class Debugger:
                     lines.append((f"RESULT: hit state cap ({st.get('states',0)}) - gave up", C_TAIL_NO))
                 else:
                     lines.append(("RESULT: no safe path exists (searched every body-config)", C_TAIL_NO))
+        elif self.view == "bfs":
+            lines.append((f"VIEW: BFS -> apple (fast, cell,time)   snake len {len(self.snake)}   apple {self.apple}", C_TEXT))
+            lines.append((f"visited {len(st.get('visited', ()))}   frontier {len(st.get('frontier', ()))}"
+                            + ("   [running]" if not done else ""), C_DIM))
+            if done:
+                if st.get("safe"):
+                    lines.append((f"RESULT: SAFE path, length {len(st.get('result', []))}", C_RESULT))
+                else:
+                    lines.append(("RESULT: no SAFE path found (fast search) - try TAB to the complete view", C_TAIL_NO))
         else:
             lines.append((f"VIEW: A* -> tail (accurate) on {self.flood_label}", C_TEXT))
             lines.append((f"visited {len(st.get('visited', ()))}   frontier {len(st.get('frontier', ()))}"
@@ -635,7 +696,7 @@ class Debugger:
                     elif e.key == pygame.K_r:
                         self.rebuild()
                     elif e.key == pygame.K_TAB:
-                        views = ["astar", "complete", "tail"]
+                        views = ["astar", "complete", "bfs", "tail"]
                         self.view = views[(views.index(self.view) + 1) % len(views)]
                         self.rebuild()
                     elif e.key == pygame.K_p:
